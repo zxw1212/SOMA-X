@@ -12,9 +12,13 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from soma import SOMALayer
-from soma.geometry.rig_utils import joint_local_to_world, joint_world_to_local
-from tools.vis_pyrender import (
+repo_root = Path(__file__).resolve().parents[1]
+if str(repo_root) not in sys.path:
+    sys.path.insert(0, str(repo_root))
+
+from soma import SOMALayer  # noqa: E402
+from soma.geometry.rig_utils import joint_local_to_world, joint_world_to_local  # noqa: E402
+from tools.vis_pyrender import (  # noqa: E402
     MeshRenderer,
     default_pyopengl_platform,
     look_at,
@@ -148,10 +152,6 @@ def main():
             f"Invalid identity model type(s): {invalid_models}. Valid options: {valid_models}"
         )
     args.identity_models = identity_models
-
-    repo_root = Path(__file__).resolve().parents[1]
-    if str(repo_root) not in sys.path:
-        sys.path.insert(0, str(repo_root))
 
     set_pyopengl_platform(args.pyopengl_platform)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")

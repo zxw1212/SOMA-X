@@ -24,23 +24,25 @@ import numpy as np
 import smplx
 import torch
 
-from soma.geometry.rig_utils import remove_joint_orient_local
-from soma.geometry.transforms import matrix_to_rotvec, rotation_6d_to_matrix
-from soma.io import add_npz_args, save_soma_npz
-from soma.pose_inversion import PoseInversion
-from soma.soma import SOMALayer
-from soma.units import Unit
-from tools.vis_pyrender import (
+repo_root = Path(__file__).resolve().parents[1]
+if str(repo_root) not in sys.path:
+    sys.path.insert(0, str(repo_root))
+
+from soma.geometry.rig_utils import remove_joint_orient_local  # noqa: E402
+from soma.geometry.transforms import matrix_to_rotvec, rotation_6d_to_matrix  # noqa: E402
+from soma.io import add_npz_args, save_soma_npz  # noqa: E402
+from soma.pose_inversion import PoseInversion  # noqa: E402
+from soma.soma import SOMALayer  # noqa: E402
+from soma._compat import ensure_chumpy_numpy_compat  # noqa: E402
+from soma.units import Unit  # noqa: E402
+from tools.vis_pyrender import (  # noqa: E402
     default_pyopengl_platform,
     render_comparison_video,
     set_pyopengl_platform,
 )
 
-repo_root = Path(__file__).resolve().parents[1]
-if str(repo_root) not in sys.path:
-    sys.path.insert(0, str(repo_root))
-
 set_pyopengl_platform(default_pyopengl_platform())
+ensure_chumpy_numpy_compat()
 
 
 def main():

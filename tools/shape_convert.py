@@ -8,6 +8,7 @@ This class handles the conversion of MHR shape parameters to SMPL shape paramete
 """
 
 import argparse
+import sys
 from pathlib import Path
 
 import imageio
@@ -18,10 +19,14 @@ import torch.nn.functional as F
 import trimesh
 from tqdm import tqdm
 
-from soma.geometry.barycentric_interp import BarycentricInterpolator
-from soma.geometry.batched_skinning import BatchedSkinning
-from soma.soma import SOMALayer
-from tools.vis_pyrender import MeshRenderer, look_at, set_pyopengl_platform
+repo_root = Path(__file__).resolve().parents[1]
+if str(repo_root) not in sys.path:
+    sys.path.insert(0, str(repo_root))
+
+from soma.geometry.barycentric_interp import BarycentricInterpolator  # noqa: E402
+from soma.geometry.batched_skinning import BatchedSkinning  # noqa: E402
+from soma.soma import SOMALayer  # noqa: E402
+from tools.vis_pyrender import MeshRenderer, look_at, set_pyopengl_platform  # noqa: E402
 
 
 def get_smooth_noise(T, dim, device, num_keyframes=None, mode="normal"):

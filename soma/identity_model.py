@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import trimesh
 
+from ._compat import ensure_chumpy_numpy_compat
 from .geometry.barycentric_interp import BarycentricInterpolator
 from .geometry.laplacian import LaplacianMesh
 from .units import Unit
@@ -358,16 +359,24 @@ class SMPLIdentityModel(BaseIdentityModel):
         }
         super().__init__(data_root, low_lod, device, **kwargs)
 
+        missing_smpl_deps_msg = (
+            "SMPL/SMPL-X support requires 'smplx' and 'chumpy' in the same Python environment "
+            "that runs this script.\n"
+            "Install with one of:\n"
+            "  pip install smplx\n"
+            "  pip install --no-build-isolation chumpy\n"
+            "or, if you use uv with a virtualenv:\n"
+            "  uv pip install --python .venv/bin/python smplx\n"
+            "  uv pip install --python .venv/bin/python --no-build-isolation chumpy\n"
+            "If chumpy install fails, try:\n"
+            "  pip install --no-build-isolation git+https://github.com/mattloper/chumpy@580566eafc9ac68b2614b64d6f7aaa8"
+        )
+
         try:
+            ensure_chumpy_numpy_compat()
             import smplx
         except ImportError as e:
-            raise ImportError(
-                "SMPL/SMPL-X support requires 'smplx' and 'chumpy'. Install with:\n"
-                "  pip install smplx\n"
-                "  pip install --no-build-isolation chumpy\n"
-                "If that fails, install chumpy from source:\n"
-                "  pip install --no-build-isolation git+https://github.com/mattloper/chumpy@580566eafc9ac68b2614b64d6f7aaa8"
-            ) from e
+            raise ImportError(missing_smpl_deps_msg) from e
 
         imt = model_type
         model_kwargs = smpl_kwargs if smpl_kwargs else {}
@@ -396,13 +405,18 @@ class SMPLIdentityModel(BaseIdentityModel):
                     f"<data_root>/{imt.upper()}/."
                 )
 
-        smpl_base_model = smplx.create(
-            model_type=imt,
-            model_path=model_path,
-            device=self.device,
-            ext=model_path.suffix[1:],
-            **model_kwargs,
-        ).to(self.device)
+        try:
+            smpl_base_model = smplx.create(
+                model_type=imt,
+                model_path=model_path,
+                device=self.device,
+                ext=model_path.suffix[1:],
+                **model_kwargs,
+            ).to(self.device)
+        except ModuleNotFoundError as e:
+            if e.name == "chumpy":
+                raise ImportError(missing_smpl_deps_msg) from e
+            raise
 
         self.identity_model = SMPLSimplified(smpl_base_model, self.device)
 
