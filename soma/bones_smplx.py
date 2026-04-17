@@ -14,6 +14,8 @@ from scipy.spatial.transform import Rotation
 Y_UP_TO_Z_UP_ROTATION_MATRIX = np.array(
     [[1, 0, 0], [0, 0, -1], [0, 1, 0]], dtype=np.float32
 )
+_SMPLX_MODEL_CACHE: dict[tuple[str, int, str], torch.nn.Module] = {}
+_SMPLX_ZERO_PELVIS_CACHE: dict[tuple[str, str], np.ndarray] = {}
 
 
 BODY_JOINT_MAP: list[tuple[str, str]] = [
@@ -43,26 +45,6 @@ BODY_JOINT_MAP: list[tuple[str, str]] = [
 
 SMPLX_BODY_JOINT_NAMES = [smplx_name for _, smplx_name in BODY_JOINT_MAP]
 BVH_BODY_JOINT_NAMES = [bvh_name for bvh_name, _ in BODY_JOINT_MAP]
-BONE_DIRECTION_METRIC_EXCLUDED_JOINT_NAMES = {
-    "left_collar",
-    "right_collar",
-    "left_foot",
-    "right_foot",
-}
-
-
-@dataclass
-class FitMetrics:
-    mean_error_m: float
-    p95_error_m: float
-    max_error_m: float
-
-
-@dataclass
-class AngularMetrics:
-    mean_error_deg: float
-    p95_error_deg: float
-    max_error_deg: float
 
 
 @dataclass
@@ -81,11 +63,6 @@ class ConversionResult:
     reye_pose: np.ndarray
     expression: np.ndarray
     target_body_joints: np.ndarray
-    fitted_body_joints: np.ndarray
-    body_joint_error: np.ndarray
-    metrics: FitMetrics
-    bone_direction_error_deg: np.ndarray
-    bone_direction_metrics: AngularMetrics
 
 
 class BvhMotion:
@@ -180,6 +157,8 @@ class BvhMotion:
         frame_time = float(lines[motion_start + 2].split(":")[1].strip())
         block = '\n'.join(lines[motion_start + 3 : motion_start + 3 + num_frames])
         motion = np.loadtxt(io.StringIO(block), dtype=np.float32)
+        if motion.ndim == 1:
+            motion = motion[None, :]
 
         return cls(
             path=path,
@@ -312,6 +291,11 @@ class BvhMotion:
 
 
 def _create_smplx_model(model_path: str | Path, batch_size: int, device: torch.device) -> torch.nn.Module:
+    cache_key = (str(Path(model_path).resolve()), int(batch_size), str(device))
+    cached = _SMPLX_MODEL_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
     model = smplx.create(
         model_type="smplx",
         model_path=str(model_path),
@@ -319,7 +303,41 @@ def _create_smplx_model(model_path: str | Path, batch_size: int, device: torch.d
         flat_hand_mean=True,
         batch_size=batch_size,
     )
-    return model.to(device)
+    model = model.to(device)
+    model.eval()
+    _SMPLX_MODEL_CACHE[cache_key] = model
+    return model
+
+
+def _zero_pose_rest_pelvis(
+    model: torch.nn.Module,
+    *,
+    model_path: str | Path,
+    device: torch.device,
+) -> np.ndarray:
+    cache_key = (str(Path(model_path).resolve()), str(device))
+    cached = _SMPLX_ZERO_PELVIS_CACHE.get(cache_key)
+    if cached is not None:
+        return cached.copy()
+
+    with torch.no_grad():
+        z = torch.zeros
+        out = model(
+            betas=z(1, model.num_betas, dtype=torch.float32, device=device),
+            body_pose=z(1, 63, dtype=torch.float32, device=device),
+            global_orient=z(1, 3, dtype=torch.float32, device=device),
+            transl=z(1, 3, dtype=torch.float32, device=device),
+            left_hand_pose=z(1, 45, dtype=torch.float32, device=device),
+            right_hand_pose=z(1, 45, dtype=torch.float32, device=device),
+            jaw_pose=z(1, 3, dtype=torch.float32, device=device),
+            leye_pose=z(1, 3, dtype=torch.float32, device=device),
+            reye_pose=z(1, 3, dtype=torch.float32, device=device),
+            expression=z(1, 10, dtype=torch.float32, device=device),
+            return_verts=False,
+        )
+    pelvis = out.joints[0, 0].detach().cpu().numpy().astype(np.float32)
+    _SMPLX_ZERO_PELVIS_CACHE[cache_key] = pelvis
+    return pelvis.copy()
 
 
 def _run_smplx_body(
@@ -360,76 +378,6 @@ def _run_smplx_body(
     return out.joints[:, : len(SMPLX_BODY_JOINT_NAMES)]
 
 
-def compute_fit_metrics(
-    target_body_joints_m: np.ndarray | torch.Tensor,
-    fitted_body_joints_m: np.ndarray | torch.Tensor,
-) -> tuple[FitMetrics, np.ndarray]:
-    """Compute 3D joint-position error in meters.
-
-    This metric is affected by both pose mismatch and skeleton-size mismatch.
-    """
-
-    target = torch.as_tensor(target_body_joints_m, dtype=torch.float32)
-    fitted = torch.as_tensor(fitted_body_joints_m, dtype=torch.float32)
-    error = torch.norm(fitted - target, dim=-1)
-    metrics = FitMetrics(
-        mean_error_m=float(error.mean()),
-        p95_error_m=float(torch.quantile(error.flatten(), 0.95)),
-        max_error_m=float(error.max()),
-    )
-    return metrics, error.cpu().numpy()
-
-
-def compute_bone_direction_metrics(
-    target_body_joints_m: np.ndarray | torch.Tensor,
-    fitted_body_joints_m: np.ndarray | torch.Tensor,
-    parents_list: Sequence[int],
-) -> tuple[AngularMetrics, np.ndarray]:
-    """Compute parent->child bone direction error in degrees.
-
-    This mostly reflects pose-direction mismatch and is much less sensitive to
-    skeleton-size differences than raw 3D joint-position error.
-
-    The per-joint array covers all non-root body joints. The summary metrics
-    exclude `left/right_collar` and `left/right_foot`, because those joints have
-    the largest semantic-definition mismatch between BONES BVH and SMPL-X.
-    """
-
-    target = torch.as_tensor(target_body_joints_m, dtype=torch.float32)
-    fitted = torch.as_tensor(fitted_body_joints_m, dtype=torch.float32)
-
-    error_deg = torch.zeros(target.shape[:2], dtype=torch.float32)
-    valid_columns: list[torch.Tensor] = []
-
-    for joint_idx, parent_idx in enumerate(parents_list):
-        if parent_idx < 0:
-            continue
-        target_vec = target[:, joint_idx] - target[:, parent_idx]
-        fitted_vec = fitted[:, joint_idx] - fitted[:, parent_idx]
-
-        target_norm = torch.linalg.norm(target_vec, dim=-1, keepdim=True).clamp_min(1e-8)
-        fitted_norm = torch.linalg.norm(fitted_vec, dim=-1, keepdim=True).clamp_min(1e-8)
-        target_dir = target_vec / target_norm
-        fitted_dir = fitted_vec / fitted_norm
-        cosine = torch.clamp((target_dir * fitted_dir).sum(dim=-1), -1.0, 1.0)
-        joint_error = torch.rad2deg(torch.arccos(cosine))
-        error_deg[:, joint_idx] = joint_error
-        joint_name = SMPLX_BODY_JOINT_NAMES[joint_idx]
-        if joint_name not in BONE_DIRECTION_METRIC_EXCLUDED_JOINT_NAMES:
-            valid_columns.append(joint_error)
-
-    if not valid_columns:
-        raise ValueError("No valid non-root joints found for bone-direction metrics.")
-
-    flat_error = torch.cat(valid_columns, dim=0)
-    metrics = AngularMetrics(
-        mean_error_deg=float(flat_error.mean()),
-        p95_error_deg=float(torch.quantile(flat_error, 0.95)),
-        max_error_deg=float(flat_error.max()),
-    )
-    return metrics, error_deg.cpu().numpy()
-
-
 def _transform_points_y_up_to_z_up(points: np.ndarray) -> np.ndarray:
     return points @ Y_UP_TO_Z_UP_ROTATION_MATRIX.T
 
@@ -462,7 +410,7 @@ def _unwrap_rotvec(rotvecs: np.ndarray) -> np.ndarray:
 
 
 def _transform_root_orient_y_up_to_z_up(root_orient: np.ndarray) -> np.ndarray:
-    root_rot_mats = Rotation.from_rotvec(root_orient).as_matrix()
+    root_rot_mats = Rotation.from_rotvec(root_orient).as_matrix().astype(np.float32)
     transformed = Y_UP_TO_Z_UP_ROTATION_MATRIX[None] @ root_rot_mats
     rotvecs = Rotation.from_matrix(transformed).as_rotvec().astype(np.float32)
     return _unwrap_rotvec(rotvecs)
@@ -553,9 +501,6 @@ def load_smplx_body_joints_from_npz(
         ),
         "fps": float(np.asarray(data.get("mocap_frame_rate", data.get("fps", 30.0)), dtype=np.float32)),
         "source_path": str(data.get("source_path", "")),
-        "stored_fitted_body_joints": (
-            np.asarray(data["fitted_body_joints"], dtype=np.float32) if "fitted_body_joints" in data else None
-        ),
         "stored_target_body_joints": (
             np.asarray(data["target_body_joints"], dtype=np.float32) if "target_body_joints" in data else None
         ),
@@ -771,10 +716,9 @@ def _validate_calibration_motion_compatibility(
         motion.parents, calibration_motion.parents
     ):
         raise ValueError("Calibration BVH hierarchy does not match the input BVH.")
-    if motion.offsets_cm.shape != calibration_motion.offsets_cm.shape or not np.allclose(
-        motion.offsets_cm, calibration_motion.offsets_cm, atol=1e-4
-    ):
-        raise ValueError("Calibration BVH offsets do not match the input BVH skeleton.")
+    # External calibration is used here only to provide a compatible joint-frame definition.
+    # Bone lengths may differ across files in the same SOMA skeleton family, so we do not
+    # require identical OFFSET values.
     if motion.channels != calibration_motion.channels:
         raise ValueError("Calibration BVH channel layout does not match the input BVH.")
 
@@ -920,54 +864,23 @@ def convert_bvh_to_smplx_direct(
     )
 
     # Convert to axis-angle
-    global_orient_rv = Rotation.from_matrix(
-        smplx_local[:, 0].reshape(-1, 3, 3)
-    ).as_rotvec().astype(np.float32).reshape(num_frames, 3)
+    global_orient_rv = Rotation.from_matrix(smplx_local[:, 0].reshape(-1, 3, 3)).as_rotvec().astype(
+        np.float32
+    ).reshape(num_frames, 3)
     global_orient_rv = _unwrap_rotvec(global_orient_rv)
 
-    body_pose_rv = Rotation.from_matrix(
-        smplx_local[:, 1:].reshape(-1, 3, 3)
-    ).as_rotvec().astype(np.float32).reshape(num_frames, 21, 3)
+    body_pose_rv = Rotation.from_matrix(smplx_local[:, 1:].reshape(-1, 3, 3)).as_rotvec().astype(
+        np.float32
+    ).reshape(num_frames, 21, 3)
     for j in range(21):
         body_pose_rv[:, j] = _unwrap_rotvec(body_pose_rv[:, j])
     body_pose_rv = body_pose_rv.reshape(num_frames, 63)
 
     # Translation: match BVH pelvis world position
     bvh_pelvis = target_body_joints[:, 0]
-    with torch.no_grad():
-        z = torch.zeros
-        out = model(
-            betas=z(1, model.num_betas, dtype=torch.float32, device=device_t),
-            body_pose=z(1, 63, dtype=torch.float32, device=device_t),
-            global_orient=z(1, 3, dtype=torch.float32, device=device_t),
-            transl=z(1, 3, dtype=torch.float32, device=device_t),
-            left_hand_pose=z(1, 45, dtype=torch.float32, device=device_t),
-            right_hand_pose=z(1, 45, dtype=torch.float32, device=device_t),
-            jaw_pose=z(1, 3, dtype=torch.float32, device=device_t),
-            leye_pose=z(1, 3, dtype=torch.float32, device=device_t),
-            reye_pose=z(1, 3, dtype=torch.float32, device=device_t),
-            expression=z(1, 10, dtype=torch.float32, device=device_t),
-            return_verts=False,
-        )
-        rest_pelvis = out.joints[0, 0].cpu().numpy()
+    rest_pelvis = _zero_pose_rest_pelvis(model, model_path=model_path, device=device_t)
     go_mats = Rotation.from_rotvec(global_orient_rv).as_matrix().astype(np.float32)
     transl_np = bvh_pelvis - np.einsum("bij,j->bi", go_mats, rest_pelvis)
-
-    # Compute fitted joints for metrics
-    fitted_body_np = _run_smplx_body_numpy(
-        model_path=model_path,
-        betas=betas_np,
-        body_pose=body_pose_rv,
-        global_orient=global_orient_rv,
-        transl=transl_np,
-        device=device,
-    )
-    metrics, body_joint_error = compute_fit_metrics(target_body_joints, fitted_body_np)
-    bone_direction_metrics, bone_direction_error_deg = compute_bone_direction_metrics(
-        target_body_joints,
-        fitted_body_np,
-        parents_list,
-    )
 
     z_np = np.zeros
     return ConversionResult(
@@ -985,11 +898,6 @@ def convert_bvh_to_smplx_direct(
         reye_pose=z_np((num_frames, 3), dtype=np.float32),
         expression=z_np((num_frames, 10), dtype=np.float32),
         target_body_joints=target_body_joints.astype(np.float32),
-        fitted_body_joints=fitted_body_np.astype(np.float32),
-        body_joint_error=body_joint_error.astype(np.float32),
-        metrics=metrics,
-        bone_direction_error_deg=bone_direction_error_deg.astype(np.float32),
-        bone_direction_metrics=bone_direction_metrics,
     )
 
 
@@ -1014,21 +922,10 @@ def save_conversion_result(
         root_orient = _transform_root_orient_y_up_to_z_up(result.global_orient.astype(np.float32))
         trans = _transform_points_y_up_to_z_up(result.transl.astype(np.float32))
         target_body_joints = _transform_points_y_up_to_z_up(result.target_body_joints.astype(np.float32))
-        fitted_body_joints = _transform_points_y_up_to_z_up(result.fitted_body_joints.astype(np.float32))
-        if model_path is not None:
-            fitted_body_joints = _run_smplx_body_numpy(
-                model_path=model_path,
-                betas=result.betas.astype(np.float32),
-                body_pose=result.body_pose.astype(np.float32),
-                global_orient=root_orient,
-                transl=trans,
-                device=device,
-            )
     else:
         root_orient = result.global_orient.astype(np.float32)
         trans = result.transl.astype(np.float32)
         target_body_joints = result.target_body_joints.astype(np.float32)
-        fitted_body_joints = result.fitted_body_joints.astype(np.float32)
 
     pose_body = result.body_pose.astype(np.float32)
     pose_jaw = result.jaw_pose.astype(np.float32)
@@ -1070,22 +967,6 @@ def save_conversion_result(
         bvh_body_joint_names=np.asarray(BVH_BODY_JOINT_NAMES),
         smplx_body_joint_names=np.asarray(SMPLX_BODY_JOINT_NAMES),
         target_body_joints=target_body_joints,
-        fitted_body_joints=fitted_body_joints,
-        body_joint_position_error=result.body_joint_error,
-        body_joint_position_mean_m=np.array(result.metrics.mean_error_m, dtype=np.float32),
-        body_joint_position_p95_m=np.array(result.metrics.p95_error_m, dtype=np.float32),
-        body_joint_position_max_m=np.array(result.metrics.max_error_m, dtype=np.float32),
-        bone_direction_error_deg=result.bone_direction_error_deg,
-        bone_direction_metric_excluded_joint_names=np.asarray(
-            sorted(BONE_DIRECTION_METRIC_EXCLUDED_JOINT_NAMES)
-        ),
-        bone_direction_mean_deg=np.array(result.bone_direction_metrics.mean_error_deg, dtype=np.float32),
-        bone_direction_p95_deg=np.array(result.bone_direction_metrics.p95_error_deg, dtype=np.float32),
-        bone_direction_max_deg=np.array(result.bone_direction_metrics.max_error_deg, dtype=np.float32),
-        body_joint_error=result.body_joint_error,
-        mean_error_m=np.array(result.metrics.mean_error_m, dtype=np.float32),
-        p95_error_m=np.array(result.metrics.p95_error_m, dtype=np.float32),
-        max_error_m=np.array(result.metrics.max_error_m, dtype=np.float32),
         coord_system=np.array("z_up" if export_z_up else "y_up"),
     )
 

@@ -132,7 +132,7 @@ ls assets/SMPLX/SMPLX_NEUTRAL.npz
   convert_output/walk_forward_professional_003__A001_smplx.npz \
   --device cpu \
   --calibration-bvh assets/calibration/soma_t_pose.bvh \
-  --calibration-bvh-frame 5
+  --calibration-bvh-frame 0
 ```
 
 这里 `--calibration-bvh-frame 5` 的含义是：使用 `assets/calibration/soma_t_pose.bvh` 里的第 `5` 帧，也就是原始大 BVH 的第 `10` 帧，作为标定 pose。
@@ -149,6 +149,21 @@ ls assets/SMPLX/SMPLX_NEUTRAL.npz
   /home/zxw/Documents/bones_studio_demo/smplx_npz \
   --device cpu
 ```
+
+如果是 CPU 批量转换，可以加多进程：
+
+```bash
+.venv/bin/python tools/convert_bones_soma_bvh_to_smplx.py \
+  /home/zxw/Documents/bones_studio_demo/soma_uniform/bvh \
+  /home/zxw/Documents/bones_studio_demo/smplx_npz \
+  --device cpu \
+  --num-workers 8
+```
+--resume: 
+  - 默认 false：不跳过，已有目标 .npz 也会重转覆盖
+  - 传 --resume：跳过已存在且非空的目标 .npz
+  - 如果目标文件存在但大小为 0，不会跳过，仍会重转
+
 
 如果你只想先抽样测试前几个文件：
 
@@ -172,6 +187,15 @@ ls assets/SMPLX/SMPLX_NEUTRAL.npz
 
 当前实现已经验证可在 CPU 运行。
 
+如果机器上有可用 GPU，也可以直接用：
+
+```bash
+--device cuda:0
+```
+
+当前实现里，SMPL-X FK 相关部分会走你指定的 torch device。
+但 BVH 解析、BVH FK、以及部分 NumPy 逻辑仍然在 CPU，所以它不是全流程 GPU。
+
 ### `--frame-stride`
 
 按时间下采样。
@@ -193,6 +217,22 @@ ls assets/SMPLX/SMPLX_NEUTRAL.npz
 ```bash
 --max-frames 32
 ```
+
+### `--num-workers`
+
+目录批量转换时，CPU 模式下可用多进程并行处理多个 BVH。
+
+例如：
+
+```bash
+--num-workers 8
+```
+
+注意：
+
+- 这个参数主要是给 `--device cpu` 的目录批量模式准备的
+- 如果 `--device` 不是 `cpu`，当前实现会自动退回单 worker，避免多个进程同时抢同一块 GPU
+- 单个 BVH 文件本身不会被切成多个 worker；这是“文件级并行”
 
 ### `--direct-tpose-frame`
 
@@ -235,7 +275,7 @@ ls assets/SMPLX/SMPLX_NEUTRAL.npz
 例如：
 
 ```bash
---calibration-bvh-frame 5
+--calibration-bvh-frame 0
 ```
 
 如果不传，脚本会在这个外部 BVH 上先选一个参考帧，再自动构造 synthetic T-pose。
@@ -260,20 +300,6 @@ ls assets/SMPLX/SMPLX_NEUTRAL.npz
 - `bvh_body_joint_names`
 - `smplx_body_joint_names`
 - `target_body_joints`
-- `fitted_body_joints`
-- `body_joint_error`
-- `body_joint_position_error`
-- `bone_direction_error_deg`
-- `bone_direction_metric_excluded_joint_names`
-- `mean_error_m`
-- `p95_error_m`
-- `max_error_m`
-- `body_joint_position_mean_m`
-- `body_joint_position_p95_m`
-- `body_joint_position_max_m`
-- `bone_direction_mean_deg`
-- `bone_direction_p95_deg`
-- `bone_direction_max_deg`
 
 主要关心的字段通常是：
 
@@ -281,13 +307,6 @@ ls assets/SMPLX/SMPLX_NEUTRAL.npz
 - `global_orient`: `(T, 3)`
 - `body_pose`: `(T, 63)`
 - `transl`: `(T, 3)`
-
-误差字段说明：
-
-- `body_joint_error` 和 `body_joint_position_error` 是同一份 3D 关节位置误差，单位米；前者是兼容旧字段名，后者是更明确的新字段名
-- `mean_error_m / p95_error_m / max_error_m` 也是旧字段名，对应的仍然是 body joint position error
-- `bone_direction_error_deg` 是逐帧逐骨的方向夹角误差，单位度
-- `bone_direction_mean_deg / bone_direction_p95_deg / bone_direction_max_deg` 的统计默认排除了 `left_collar / right_collar / left_foot / right_foot`
 
 ## 8. Python 直接调用
 
@@ -307,13 +326,6 @@ result = convert_bvh_to_smplx_direct(
     calibration_bvh_frame=5,
 )
 
-print(result.metrics.mean_error_m)
-print(result.metrics.p95_error_m)
-print(result.metrics.max_error_m)
-print(result.bone_direction_metrics.mean_error_deg)
-print(result.bone_direction_metrics.p95_error_deg)
-print(result.bone_direction_metrics.max_error_deg)
-
 save_conversion_result(
     result,
     "convert_output/sample_smplx.npz",
@@ -321,31 +333,11 @@ save_conversion_result(
 )
 ```
 
-## 9. 误差字段
+## 9. 误差评估
 
-转换脚本不再在终端打印误差统计。
+转换脚本不再在终端打印误差统计，也不再把误差字段写入导出的 `.npz`。
 
-如果你需要看误差，可以直接读取导出的 `.npz` 中这些字段：
-
-- `body_joint_error`
-- `body_joint_position_error`
-- `mean_error_m`
-- `p95_error_m`
-- `max_error_m`
-- `bone_direction_error_deg`
-- `bone_direction_metric_excluded_joint_names`
-- `bone_direction_mean_deg`
-- `bone_direction_p95_deg`
-- `bone_direction_max_deg`
-
-其中：
-
-- `body_joint_error` 和 `body_joint_position_error` 是同一份 3D 关节位置误差，单位米；前者是兼容旧字段名
-- `mean_error_m / p95_error_m / max_error_m` 也是旧字段名，对应的仍然是 body joint position error
-- `bone_direction_error_deg` 是逐帧逐骨的方向夹角误差，单位度
-- `bone_direction_mean_deg / bone_direction_p95_deg / bone_direction_max_deg` 的统计默认排除了 `left_collar / right_collar / left_foot / right_foot`
-
-另外现在也提供了一个专门的评估脚本，可以直接对 `bvh` 和导出的 `npz` 做逐帧 pose error 分析。
+如果你需要单独评估 `bvh` 和导出 `npz` 的姿态差异，可以使用专门的评估脚本。
 
 示例：
 
@@ -384,6 +376,8 @@ save_conversion_result(
 2. 输出里 `left_hand_pose/right_hand_pose/jaw_pose/leye_pose/reye_pose/expression` 目前为 0。
 3. 这是 joint-based 拟合（位置 + 旋转），不是 mesh-level 拟合，所以局部扭转和细节不会完全恢复。
 4. 误差可接受不代表所有动作都同样稳定，极端动作仍建议单独抽样检查。
+5. `--device cuda:0` 只会加速 torch / SMPL-X 相关部分；BVH 读取和部分旋转处理仍然在 CPU。
+6. `--num-workers` 是文件级并行，不是单文件内的逐帧并行。
 
 ## 11. 建议使用流程
 
